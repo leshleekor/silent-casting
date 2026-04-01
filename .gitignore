@@ -1,0 +1,12 @@
+.claude
+.claude/*
+docs
+docs/*
+__pycache__
+__pycache__/*
+
+.DS_Store
+.env
+.tmp/
+
+
