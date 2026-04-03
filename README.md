@@ -6,6 +6,7 @@ Silent Casting은 GitHub 저장소의 `skills/` 디렉토리를 로컬로 동기
 
 - source repo를 `SKILLS_SYNC_DIR/repo`에 clone 또는 update합니다.
 - `skills/` 트리를 Claude/Codex가 읽는 로컬 Skills 디렉토리로 복사합니다.
+- `profiles.json`과 `selection.json`을 사용해 필요한 Skill만 선택적으로 동기화할 수 있습니다.
 - 원하면 `SessionStart` hook을 등록해 실행 직전에 자동으로 동기화합니다.
 - 동기화에 실패하더라도 마지막으로 성공한 로컬 Skills가 있으면 그대로 유지합니다.
 
@@ -13,7 +14,7 @@ Silent Casting은 GitHub 저장소의 `skills/` 디렉토리를 로컬로 동기
 
 - macOS 또는 Linux
 - `bash`, `git`
-- `python3` (`--bootstrap` 사용 시 필요)
+- `python3` (`--bootstrap` 또는 선택적 동기화 사용 시 필요)
 - Claude Code 또는 Codex
 - 루트에 `skills/` 디렉토리가 있는 Git 저장소
 
@@ -30,12 +31,46 @@ your-skills-repo/
 │  │  └─ api-review/SKILL.md
 │  └─ frontend/
 │     └─ accessibility-check/SKILL.md
+├─ profiles.json
 └─ manifest.json
 ```
 
 - 각 Skill은 자체 디렉토리 안에 `SKILL.md`를 가집니다.
 - `skills/` 아래 구조는 Claude/Codex 설치 디렉토리로 그대로 복사됩니다.
+- `profiles.json`은 역할별 Skill 묶음과 기본 선택 규칙을 정의하는 선택 파일입니다.
 - `manifest.json`은 선택 사항입니다. 있으면 로컬 캐시에 복사되며, 없어도 동기화 자체는 가능합니다.
+
+### `profiles.json` 예시
+
+```json
+{
+  "version": 1,
+  "mandatory": ["common/logging"],
+  "default_profiles": ["backend"],
+  "profiles": {
+    "backend": {
+      "include": ["backend/*", "common/review-basics"],
+      "exclude": ["backend/legacy-*"]
+    },
+    "frontend": {
+      "include": ["frontend/*", "common/review-basics"]
+    }
+  }
+}
+```
+
+### 로컬 `selection.json` 예시
+
+기본 경로는 `$SKILLS_SYNC_DIR/selection.json`입니다.
+
+```json
+{
+  "version": 1,
+  "profiles": ["backend"],
+  "include": ["common/security-extended"],
+  "exclude": ["backend/legacy-*"]
+}
+```
 
 ## 빠른 시작
 
@@ -46,11 +81,9 @@ your-skills-repo/
 ### 1. 이 저장소를 안정적인 경로에 clone
 
 ```bash
-git clone <THIS_REPOSITORY_URL> "$HOME/tools/silent-casting"
+git clone https://github.com/leshleekor/silent-casting.git "$HOME/tools/silent-casting"
 cd "$HOME/tools/silent-casting"
 ```
-
-`<THIS_REPOSITORY_URL>`에는 GitHub의 `Code` 버튼에서 복사한 이 저장소의 clone URL을 넣으시면 됩니다.
 
 ### 2. source skills 저장소 정보 설정
 
@@ -121,6 +154,48 @@ $HOME/.company-skills/
 - Codex: `~/.agents/skills/<category>/<skill-name>/SKILL.md`
 - 마지막 동기화 정보: `$SKILLS_SYNC_DIR/state/*-last-sync.env`
 
+## 선택적 동기화
+
+`profiles.json`이 source repo에 있으면 Silent Casting은 전체 Skill 복사 대신 선택 규칙을 계산해 필요한 Skill만 설치합니다.
+
+선택 우선순위는 아래와 같습니다.
+
+1. CLI 옵션
+2. 환경 변수
+3. 로컬 `selection.json`
+4. `profiles.json`의 `default_profiles`
+
+지원 옵션은 아래와 같습니다.
+
+```bash
+bash scripts/run.sh --target codex \
+  --profile backend \
+  --include common/security-extended \
+  --exclude backend/legacy-* \
+  --print-selection
+```
+
+지원 환경 변수는 아래와 같습니다.
+
+```bash
+export SKILLS_PROFILE="backend,devops"
+export SKILLS_INCLUDE="common/security-extended"
+export SKILLS_EXCLUDE="backend/legacy-*"
+export SKILLS_SELECTION_FILE="$HOME/.company-skills/selection.json"
+```
+
+지속적으로 유지할 개인 설정은 환경 변수보다 `selection.json`에 두는 편이 안전합니다. bootstrap hook은 실행 명령을 고정 저장하므로, 선택 규칙을 환경 변수에만 두면 hook 사용 시 다시 bootstrap이 필요할 수 있습니다.
+
+### 선택 결과 미리 보기
+
+실제 복사 전에 최종 선택 결과만 확인하려면 아래처럼 실행합니다.
+
+```bash
+bash scripts/run.sh --target codex --print-selection
+```
+
+이 명령은 사용된 프로필, include/exclude, 최종 선택된 Skill ID 목록을 출력하고 종료합니다.
+
 ## 사용 방법
 
 ### Claude Code
@@ -162,6 +237,7 @@ bash /path/to/silent-casting/scripts/generate-manifest.sh
 
 - source repo 로컬 cache: `$SKILLS_SYNC_DIR/repo`
 - 캐시된 manifest: `$SKILLS_SYNC_DIR/manifest.json`
+- 로컬 선택 설정: `$SKILLS_SYNC_DIR/selection.json`
 - 마지막 동기화 정보: `$SKILLS_SYNC_DIR/state/*.env`
 - Claude Code 설치 대상: `~/.claude/skills`
 - Codex 설치 대상: `~/.agents/skills`
@@ -177,6 +253,12 @@ bash /path/to/silent-casting/scripts/generate-manifest.sh
 - source repo 접근 권한이 있는지 확인합니다.
 - SSH 또는 토큰 설정을 확인합니다.
 - 네트워크 오류가 발생하더라도 이전에 성공한 로컬 Skills가 있으면 그것을 계속 사용합니다.
+
+### `unknown profile name` 또는 패턴 불일치 오류
+
+- `profiles.json`에 정의된 프로필 이름인지 확인합니다.
+- `include` 또는 `exclude`에 적은 Skill ID나 패턴이 실제 `skills/` 구조와 일치하는지 확인합니다.
+- 선택 계산이 실패하면 Silent Casting은 기존 로컬 Skills를 유지합니다.
 
 ### bootstrap 이후 저장소 위치를 옮긴 경우
 
