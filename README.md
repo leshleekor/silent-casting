@@ -4,11 +4,13 @@ Silent Casting은 GitHub 저장소의 `skills/` 디렉토리를 로컬로 동기
 
 ## 제공 기능
 
-- source repo를 `SKILLS_SYNC_DIR/repo`에 clone 또는 update합니다.
+- source repo를 `SKILLS_SYNC_DIR/repo`에 clone 또는 update하고, cache repo를 source repo의 mirror 상태로 유지합니다.
 - `skills/` 트리를 Claude/Codex가 읽는 로컬 Skills 디렉토리로 복사합니다.
 - `profiles.json`과 `selection.json`을 사용해 필요한 Skill만 선택적으로 동기화할 수 있습니다.
+- 설치 대상 디렉토리 루트를 교체하지 않고, Silent Casting이 관리하는 Skill ID 경로만 갱신합니다.
+- Silent Casting이 관리하지 않는 기존 다른 Skills는 보존합니다.
 - 원하면 `SessionStart` hook을 등록해 실행 직전에 자동으로 동기화합니다.
-- 동기화에 실패하더라도 마지막으로 성공한 로컬 Skills가 있으면 그대로 유지합니다.
+- 동기화에 실패하더라도 Silent Casting의 마지막 성공 상태가 있으면 기존 로컬 Skills를 그대로 유지합니다.
 
 ## 준비물
 
@@ -133,7 +135,7 @@ bash scripts/run.sh --bootstrap --target codex
 bash scripts/run.sh --bootstrap --target all
 ```
 
-`--bootstrap`는 사용자 설정에 관리용 hook을 등록합니다. 같은 명령을 다시 실행하더라도 이 프로젝트가 관리하는 hook만 갱신하므로, source repo URL·브랜치·설치 경로가 바뀌었을 때 다시 실행하셔도 됩니다.
+`--bootstrap`는 사용자 설정에 관리용 hook을 등록합니다. 같은 명령을 다시 실행하더라도 이 프로젝트가 관리하는 hook만 갱신하므로, source repo URL·브랜치·설치 경로가 바뀌었을 때 다시 실행하셔도 됩니다. 기존 cache repo가 있더라도 source repo URL이 바뀌면 cache의 `origin`도 새 URL로 갱신됩니다.
 
 ### 4. 설치 확인
 
@@ -184,7 +186,7 @@ export SKILLS_EXCLUDE="backend/legacy-*"
 export SKILLS_SELECTION_FILE="$HOME/.company-skills/selection.json"
 ```
 
-지속적으로 유지할 개인 설정은 환경 변수보다 `selection.json`에 두는 편이 안전합니다. bootstrap hook은 실행 명령을 고정 저장하므로, 선택 규칙을 환경 변수에만 두면 hook 사용 시 다시 bootstrap이 필요할 수 있습니다.
+지속적으로 유지할 개인 설정은 `selection.json`에 두는 편이 가장 명확합니다. `--bootstrap`은 bootstrap 시점의 CLI 선택 옵션과 환경 변수 선택값을 hook 명령에 고정 저장합니다. 이후 선택 규칙을 바꾸려면 `selection.json`을 수정하거나 새 선택 옵션으로 `--bootstrap`을 다시 실행하세요.
 
 ### 선택 결과 미리 보기
 
@@ -195,6 +197,17 @@ bash scripts/run.sh --target codex --print-selection
 ```
 
 이 명령은 사용된 프로필, include/exclude, 최종 선택된 Skill ID 목록을 출력하고 종료합니다.
+
+### 기존 Skills와의 공존 방식
+
+Silent Casting은 설치 대상 디렉토리 루트를 이동하거나 교체하지 않습니다.
+
+- 기존에 이미 있던 다른 Skills는 그대로 유지합니다.
+- Silent Casting이 이전에 설치한 Skill ID만 추적해서 갱신하거나 제거합니다.
+- 이번 sync 결과에서 빠진 Skill은, 과거에 Silent Casting이 설치했던 Skill인 경우에만 제거합니다.
+- 동기화는 선택된 Skill ID 경로 단위로만 수행되며, `~/.claude/skills` 또는 `~/.agents/skills` 전체를 삭제하지 않습니다.
+
+다만 같은 Skill ID 경로를 Silent Casting이 다시 관리하게 되면, 해당 경로의 내용은 Silent Casting 기준으로 갱신됩니다. 대상 Skill ID의 부모 경로가 symlink이면 대상 디렉토리 밖을 건드릴 수 있으므로 동기화를 중단합니다.
 
 ## 사용 방법
 
@@ -252,7 +265,12 @@ bash /path/to/silent-casting/scripts/generate-manifest.sh
 
 - source repo 접근 권한이 있는지 확인합니다.
 - SSH 또는 토큰 설정을 확인합니다.
-- 네트워크 오류가 발생하더라도 이전에 성공한 로컬 Skills가 있으면 그것을 계속 사용합니다.
+- 네트워크 오류가 발생하더라도 Silent Casting의 이전 성공 상태가 있으면 그것을 계속 사용합니다.
+- 첫 설치처럼 Silent Casting 성공 상태가 아직 없으면 실패로 종료합니다.
+
+### cache repo에 남아 있는 파일이 동기화에 영향을 주는 경우
+
+`$SKILLS_SYNC_DIR/repo`는 source repo의 작업 복사본이 아니라 cache mirror로 취급됩니다. 동기화 때 source repo에 없는 untracked 파일은 제거되므로, 수동으로 유지해야 하는 파일은 cache repo 안에 두지 말고 `$SKILLS_SYNC_DIR/selection.json`처럼 cache 밖에 두세요.
 
 ### `unknown profile name` 또는 패턴 불일치 오류
 

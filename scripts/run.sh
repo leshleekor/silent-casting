@@ -13,6 +13,7 @@ CLI_SELECTION_FILE_EXPLICIT=0
 SELECTION_FILE_PATH=""
 SELECTION_FILE_REQUIRED=0
 SELECTION_LIST_FILE=""
+CURRENT_SKILL_LIST_FILE=""
 CLI_PROFILES=()
 CLI_INCLUDE=()
 CLI_EXCLUDE=()
@@ -187,65 +188,235 @@ selection_support_requested() {
   return 1
 }
 
-copy_skills_tree() {
-  local target_dir="$1"
-
-  mkdir -p "$target_dir"
-  cp -R "$SKILLS_REPO_DIR/skills/." "$target_dir/"
+build_full_skill_list() {
+  CURRENT_SKILL_LIST_FILE="$(mktemp "$SKILLS_SYNC_DIR/full-list.XXXXXX")"
+  find "$SKILLS_REPO_DIR/skills" -name SKILL.md | sort | sed "s#${SKILLS_REPO_DIR}/skills/##; s#/SKILL.md##" > "$CURRENT_SKILL_LIST_FILE"
 }
 
-copy_selected_skills() {
-  local target_dir="$1"
+managed_skill_list_file() {
+  local target_name="$1"
+  printf '%s/%s-managed-skills.txt' "$SKILLS_STATE_DIR" "$target_name"
+}
+
+validate_skill_id() {
+  local skill_id="$1"
+
+  [[ -n "$skill_id" ]] || fail "empty skill id is not allowed"
+  [[ "$skill_id" != /* ]] || fail "absolute skill id is not allowed: $skill_id"
+  [[ "$skill_id" != *\\* ]] || fail "backslash in skill id is not allowed: $skill_id"
+  [[ "$skill_id" != */ ]] || fail "trailing slash in skill id is not allowed: $skill_id"
+
+  case "/$skill_id/" in
+    *"/../"*|*"/./"*)
+      fail "relative path segment in skill id is not allowed: $skill_id"
+      ;;
+  esac
+}
+
+validate_skill_list_file() {
+  local list_file="$1"
+  local skill_id
+
+  while IFS= read -r skill_id; do
+    [[ -n "$skill_id" ]] || continue
+    validate_skill_id "$skill_id"
+  done < "$list_file"
+}
+
+skill_list_contains() {
+  local list_file="$1"
+  local skill_id="$2"
+
+  grep -Fx -- "$skill_id" "$list_file" >/dev/null 2>&1
+}
+
+assert_no_symlink_parent_dirs() {
+  local root_dir="$1"
+  local skill_id="$2"
+  local parent_rel="${skill_id%/*}"
+  local current_dir="$root_dir"
+  local segment
+
+  if [[ "$parent_rel" == "$skill_id" ]]; then
+    return
+  fi
+
+  while [[ -n "$parent_rel" ]]; do
+    segment="${parent_rel%%/*}"
+    current_dir="$current_dir/$segment"
+    if [[ -L "$current_dir" ]]; then
+      fail "refusing to sync through symlinked skill parent: $current_dir"
+    fi
+    if [[ "$parent_rel" == "$segment" ]]; then
+      break
+    fi
+    parent_rel="${parent_rel#*/}"
+  done
+}
+
+remove_empty_parent_dirs() {
+  local root_dir="$1"
+  local current_dir="$2"
+
+  while [[ "$current_dir" != "$root_dir" && "$current_dir" != "." ]]; do
+    if find "$current_dir" -mindepth 1 -maxdepth 1 | read -r _; then
+      break
+    fi
+    rmdir "$current_dir" 2>/dev/null || break
+    current_dir="$(dirname "$current_dir")"
+  done
+}
+
+remove_skill_from_tree() {
+  local tree_dir="$1"
+  local skill_id="$2"
+  local skill_dir="$tree_dir/$skill_id"
+
+  validate_skill_id "$skill_id"
+  assert_no_symlink_parent_dirs "$tree_dir" "$skill_id"
+
+  if [[ -e "$skill_dir" || -L "$skill_dir" ]]; then
+    rm -rf "$skill_dir"
+    remove_empty_parent_dirs "$tree_dir" "$(dirname "$skill_dir")"
+  fi
+}
+
+stage_selected_skills() {
+  local staging_dir="$1"
   local selection_list_file="$2"
   local skill_id
   local source_dir
-  local destination_dir
+  local staged_dir
 
+  mkdir -p "$staging_dir"
+
+  while IFS= read -r skill_id; do
+    [[ -n "$skill_id" ]] || continue
+    validate_skill_id "$skill_id"
+
+    source_dir="$SKILLS_REPO_DIR/skills/$skill_id"
+    staged_dir="$staging_dir/$skill_id"
+
+    [[ -d "$source_dir" ]] || fail "selected skill directory not found: $source_dir"
+    mkdir -p "$(dirname "$staged_dir")"
+    cp -R "$source_dir" "$staged_dir"
+  done < "$selection_list_file"
+}
+
+install_staged_skill() {
+  local target_dir="$1"
+  local staging_dir="$2"
+  local skill_id="$3"
+  local destination_dir="$target_dir/$skill_id"
+  local staged_dir="$staging_dir/$skill_id"
+  local backup_dir="$staging_dir/.backup/$skill_id"
+  local has_backup=0
+
+  [[ -d "$staged_dir" ]] || fail "staged skill directory not found: $staged_dir"
+
+  assert_no_symlink_parent_dirs "$target_dir" "$skill_id"
+
+  if [[ -e "$destination_dir" || -L "$destination_dir" ]]; then
+    mkdir -p "$(dirname "$backup_dir")"
+    mv "$destination_dir" "$backup_dir"
+    has_backup=1
+  fi
+
+  if ! mkdir -p "$(dirname "$destination_dir")"; then
+    if [[ "$has_backup" -eq 1 ]]; then
+      mkdir -p "$(dirname "$destination_dir")"
+      mv "$backup_dir" "$destination_dir"
+    fi
+    fail "failed to create target parent for skill: $skill_id"
+  fi
+
+  if ! mv "$staged_dir" "$destination_dir"; then
+    if [[ "$has_backup" -eq 1 ]]; then
+      rm -rf "$destination_dir"
+      mkdir -p "$(dirname "$destination_dir")"
+      mv "$backup_dir" "$destination_dir"
+    fi
+    fail "failed to install skill: $skill_id"
+  fi
+
+  if [[ "$has_backup" -eq 1 ]]; then
+    rm -rf "$backup_dir"
+  fi
+}
+
+sync_target_tree() {
+  local target_name="$1"
+  local target_dir="$2"
+  local managed_file
+  local staging_dir
+  local skill_id
+
+  managed_file="$(managed_skill_list_file "$target_name")"
+  staging_dir="$(mktemp -d "$SKILLS_SYNC_DIR/${target_name}.skills.XXXXXX")"
+
+  validate_skill_list_file "$CURRENT_SKILL_LIST_FILE"
+  if [[ -f "$managed_file" ]]; then
+    validate_skill_list_file "$managed_file"
+  fi
+
+  stage_selected_skills "$staging_dir" "$CURRENT_SKILL_LIST_FILE"
   mkdir -p "$target_dir"
 
   while IFS= read -r skill_id; do
     [[ -n "$skill_id" ]] || continue
-    source_dir="$SKILLS_REPO_DIR/skills/$skill_id"
-    destination_dir="$target_dir/$skill_id"
+    install_staged_skill "$target_dir" "$staging_dir" "$skill_id"
+  done < "$CURRENT_SKILL_LIST_FILE"
 
-    [[ -d "$source_dir" ]] || fail "selected skill directory not found: $source_dir"
-    mkdir -p "$(dirname "$destination_dir")"
-    cp -R "$source_dir" "$destination_dir"
-  done < "$selection_list_file"
+  if [[ -f "$managed_file" ]]; then
+    while IFS= read -r skill_id; do
+      [[ -n "$skill_id" ]] || continue
+      if ! skill_list_contains "$CURRENT_SKILL_LIST_FILE" "$skill_id"; then
+        remove_skill_from_tree "$target_dir" "$skill_id"
+      fi
+    done < "$managed_file"
+  fi
+
+  rm -rf "$staging_dir"
+}
+
+write_managed_skill_list() {
+  local target_name="$1"
+  local managed_file
+  local tmp_file
+
+  managed_file="$(managed_skill_list_file "$target_name")"
+  tmp_file="$(mktemp "$SKILLS_STATE_DIR/${target_name}-managed-skills.XXXXXX")"
+  cp "$CURRENT_SKILL_LIST_FILE" "$tmp_file"
+  mv "$tmp_file" "$managed_file"
 }
 
 stage_target() {
   local target_name="$1"
   local target_dir="$2"
-  local tmp_dir
 
-  tmp_dir="$(mktemp -d "$SKILLS_SYNC_DIR/${target_name}.tmp.XXXXXX")"
-  if [[ "$RESOLVED_SYNC_MODE" == "all" ]]; then
-    copy_skills_tree "$tmp_dir"
-  else
-    copy_selected_skills "$tmp_dir" "$SELECTION_LIST_FILE"
-  fi
-
-  mkdir -p "$(dirname "$target_dir")"
-  rm -rf "$target_dir.prev"
-  if [[ -e "$target_dir" ]]; then
-    mv "$target_dir" "$target_dir.prev"
-  fi
-
-  mv "$tmp_dir" "$target_dir"
-  rm -rf "$target_dir.prev"
+  sync_target_tree "$target_name" "$target_dir"
+  write_managed_skill_list "$target_name"
 }
 
-has_previous_target() {
+has_target_sync_state() {
+  local target_name="$1"
+  local state_file="$SKILLS_STATE_DIR/${target_name}-last-sync.env"
+  local managed_file
+
+  managed_file="$(managed_skill_list_file "$target_name")"
+  [[ -f "$state_file" && -f "$managed_file" ]]
+}
+
+has_previous_sync_state() {
   case "$SKILLS_TARGET" in
     claude)
-      [[ -d "$CLAUDE_SKILLS_DIR" ]]
+      has_target_sync_state "claude"
       ;;
     codex)
-      [[ -d "$CODEX_SKILLS_DIR" ]]
+      has_target_sync_state "codex"
       ;;
     all)
-      [[ -d "$CLAUDE_SKILLS_DIR" || -d "$CODEX_SKILLS_DIR" ]]
+      has_target_sync_state "claude" && has_target_sync_state "codex"
       ;;
   esac
 }
@@ -254,6 +425,23 @@ cache_manifest() {
   if [[ -f "$SKILLS_REPO_DIR/manifest.json" ]]; then
     cp "$SKILLS_REPO_DIR/manifest.json" "$SKILLS_MANIFEST_CACHE"
   fi
+}
+
+clean_cached_repo() {
+  local repo_real
+  local sync_real
+
+  repo_real="$(cd "$SKILLS_REPO_DIR" && pwd -P)"
+  sync_real="$(cd "$SKILLS_SYNC_DIR" && pwd -P)"
+
+  case "$repo_real" in
+    "$sync_real"/*)
+      git -C "$SKILLS_REPO_DIR" clean -ffdx
+      ;;
+    *)
+      fail "refusing to clean cache repo outside SKILLS_SYNC_DIR: $SKILLS_REPO_DIR"
+      ;;
+  esac
 }
 
 write_sync_state() {
@@ -304,13 +492,25 @@ build_hook_command() {
   local target="$1"
   local marker="silent-casting-managed:${target}"
   local command=""
+  local profile
+  local include
+  local exclude
 
   command+="SKILLS_GIT_URL=$(shell_quote "$SKILLS_GIT_URL") "
   command+="SKILLS_BRANCH=$(shell_quote "$SKILLS_BRANCH") "
   command+="SKILLS_SYNC_DIR=$(shell_quote "$SKILLS_SYNC_DIR") "
 
-  if [[ "$SELECTION_FILE_REQUIRED" -eq 1 ]]; then
+  if [[ "$CLI_SELECTION_FILE_EXPLICIT" -eq 0 && "$SELECTION_FILE_REQUIRED" -eq 1 ]]; then
     command+="SKILLS_SELECTION_FILE=$(shell_quote "$SELECTION_FILE_PATH") "
+  fi
+  if [[ "${SKILLS_PROFILE+x}" == "x" ]]; then
+    command+="SKILLS_PROFILE=$(shell_quote "$SKILLS_PROFILE") "
+  fi
+  if [[ "${SKILLS_INCLUDE+x}" == "x" ]]; then
+    command+="SKILLS_INCLUDE=$(shell_quote "$SKILLS_INCLUDE") "
+  fi
+  if [[ "${SKILLS_EXCLUDE+x}" == "x" ]]; then
+    command+="SKILLS_EXCLUDE=$(shell_quote "$SKILLS_EXCLUDE") "
   fi
 
   case "$target" in
@@ -323,6 +523,24 @@ build_hook_command() {
   esac
 
   command+="bash $(shell_quote "$RUN_SCRIPT_PATH") --target $target"
+  if [[ "$CLI_SELECTION_FILE_EXPLICIT" -eq 1 ]]; then
+    command+=" --selection-file $(shell_quote "$CLI_SELECTION_FILE")"
+  fi
+  if [[ "${#CLI_PROFILES[@]}" -gt 0 ]]; then
+    for profile in "${CLI_PROFILES[@]}"; do
+      command+=" --profile $(shell_quote "$profile")"
+    done
+  fi
+  if [[ "${#CLI_INCLUDE[@]}" -gt 0 ]]; then
+    for include in "${CLI_INCLUDE[@]}"; do
+      command+=" --include $(shell_quote "$include")"
+    done
+  fi
+  if [[ "${#CLI_EXCLUDE[@]}" -gt 0 ]]; then
+    for exclude in "${CLI_EXCLUDE[@]}"; do
+      command+=" --exclude $(shell_quote "$exclude")"
+    done
+  fi
   command+=" # $marker"
   printf '%s' "$command"
 }
@@ -412,6 +630,7 @@ initialize_full_sync_defaults() {
   RESOLVED_SELECTION_FILE=""
   RESOLVED_SELECTION_HASH="full-sync"
   RESOLVED_SKILL_COUNT="$(find "$SKILLS_REPO_DIR/skills" -name SKILL.md | wc -l | tr -d ' ')"
+  build_full_skill_list
 }
 
 print_selection() {
@@ -444,6 +663,9 @@ cleanup_selection_artifacts() {
   if [[ -n "$SELECTION_LIST_FILE" && -f "$SELECTION_LIST_FILE" ]]; then
     rm -f "$SELECTION_LIST_FILE"
   fi
+  if [[ -n "$CURRENT_SKILL_LIST_FILE" && -f "$CURRENT_SKILL_LIST_FILE" ]]; then
+    rm -f "$CURRENT_SKILL_LIST_FILE"
+  fi
 }
 
 parse_args "$@"
@@ -458,6 +680,8 @@ mkdir -p "$SKILLS_SYNC_DIR" "$SKILLS_STATE_DIR"
 trap cleanup_selection_artifacts EXIT
 
 sync_repo() {
+  local current_origin
+
   if [[ ! -d "$SKILLS_REPO_DIR/.git" ]]; then
     log "cloning skills repository"
     git clone --branch "$SKILLS_BRANCH" --depth 1 "$SKILLS_GIT_URL" "$SKILLS_REPO_DIR"
@@ -465,11 +689,21 @@ sync_repo() {
   fi
 
   log "updating skills repository"
+  current_origin="$(git -C "$SKILLS_REPO_DIR" remote get-url origin 2>/dev/null || true)"
+  if [[ "$current_origin" != "$SKILLS_GIT_URL" ]]; then
+    log "updating skills repository origin"
+    if [[ -n "$current_origin" ]]; then
+      git -C "$SKILLS_REPO_DIR" remote set-url origin "$SKILLS_GIT_URL"
+    else
+      git -C "$SKILLS_REPO_DIR" remote add origin "$SKILLS_GIT_URL"
+    fi
+  fi
   git -C "$SKILLS_REPO_DIR" fetch origin "$SKILLS_BRANCH" --depth 1
-  git -C "$SKILLS_REPO_DIR" checkout -q "$SKILLS_BRANCH"
+  git -C "$SKILLS_REPO_DIR" checkout -q -B "$SKILLS_BRANCH" "origin/$SKILLS_BRANCH"
   # This repo is a cache mirror; force local branch to tracked remote tip.
   # Using pull --ff-only with shallow history can fail even when remote only advanced.
   git -C "$SKILLS_REPO_DIR" reset --hard "origin/$SKILLS_BRANCH"
+  clean_cached_repo
 }
 
 main() {
@@ -478,17 +712,18 @@ main() {
   fi
 
   if ! sync_repo; then
-    if has_previous_target; then
+    if has_previous_sync_state; then
       log "sync failed, keeping previous target directory"
       exit 0
     fi
-    fail "sync failed and no previous target directory exists"
+    fail "sync failed and no previous Silent Casting sync state exists"
   fi
 
   [[ -d "$SKILLS_REPO_DIR/skills" ]] || fail "repository does not contain skills directory"
 
   if selection_support_requested; then
     resolve_selection
+    CURRENT_SKILL_LIST_FILE="$SELECTION_LIST_FILE"
   else
     initialize_full_sync_defaults
   fi
